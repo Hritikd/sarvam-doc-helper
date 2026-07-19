@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif; max-width:600px; margin:60px auto; text-align:center;">
+  <h2>Sarvam Voice Agent — Phase 4</h2>
+  <button id="btn" style="font-size:1.2rem; padding:12px 28px;">🎙️ Start recording</button>
+  <p id="status"></p>
+  <div id="result" style="font-size:1.1rem; margin-top:20px; text-align:left;"></div>
+  <div id="card" style="margin-top:16px;"></div>
+  <div id="reply" style="margin-top:20px; font-size:1.25rem; color:#0a5;"></div>
+
+<script>
+let recorder, chunks = [], recording = false;
+const sessionId = "sess-" + Math.random().toString(36).slice(2);
+const btn = document.getElementById("btn");
+const status = document.getElementById("status");
+const result = document.getElementById("result");
+const card = document.getElementById("card");
+const reply = document.getElementById("reply");
+
+btn.onclick = async () => {
+  if (!recording) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = handleAudio;
+    recorder.start();
+    recording = true;
+    btn.textContent = "⏹️ Stop";
+    status.textContent = "Recording… speak now";
+    card.innerHTML = ""; reply.textContent = ""; result.textContent = "";
+  } else {
+    recorder.stop();
+    recording = false;
+    btn.textContent = "🎙️ Start recording";
+    status.textContent = "Transcribing…";
+  }
+};
+
+async function handleAudio() {
+  const blob = new Blob(chunks, { type: "audio/wav" });
+  const form = new FormData();
+  form.append("audio", blob, "recording.wav");
+  const tRes = await fetch("/transcribe", { method: "POST", body: form });
+  const tData = await tRes.json();
+  const transcript = tData.transcript || JSON.stringify(tData);
+  result.textContent = "You said: " + transcript;
+
+  status.textContent = "Thinking…";
+  const rRes = await fetch("/respond", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: transcript, session: sessionId })
+  });
+  const data = await rRes.json();
+  status.textContent = "";
+
+  if (data.intent) {
+    const i = data.intent;
+    card.innerHTML =
+      '<div style="display:inline-block; text-align:left; padding:12px 20px; ' +
+      'border:2px solid #333; border-radius:12px;">' +
+      '<b>Action:</b> ' + i.action + ' &nbsp; <b>Day:</b> ' + i.day +
+      ' &nbsp; <b>Time:</b> ' + i.time + '</div>';
+  }
+  reply.textContent = "🤖 " + data.reply;
+  if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play();
+}
+</script>
+</body>
+</html>
