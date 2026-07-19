@@ -1,20 +1,85 @@
 <!DOCTYPE html>
 <html>
 <body style="font-family:sans-serif; max-width:600px; margin:60px auto; text-align:center;">
-  <h2>Sarvam Voice Agent — Phase 4</h2>
-  <button id="btn" style="font-size:1.2rem; padding:12px 28px;">🎙️ Start recording</button>
-  <p id="status"></p>
-  <div id="result" style="font-size:1.1rem; margin-top:20px; text-align:left;"></div>
-  <div id="card" style="margin-top:16px;"></div>
-  <div id="reply" style="margin-top:20px; font-size:1.25rem; color:#0a5;"></div>
+  <h2>Sarvam Doc Helper — v0</h2>
+
+  <div id="uploadBox">
+    <p>Photograph or upload a document, then ask questions about it — in voice.</p>
+    <select id="lang" style="font-size:1rem; padding:6px;">
+      <option value="hi-IN">Hindi</option>
+      <option value="kn-IN">Kannada</option>
+      <option value="en-IN">English</option>
+      <option value="ta-IN">Tamil</option>
+      <option value="te-IN">Telugu</option>
+      <option value="mr-IN">Marathi</option>
+      <option value="bn-IN">Bengali</option>
+    </select>
+    <br><br>
+    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.pdf">
+    <br><br>
+    <button id="uploadBtn" style="font-size:1.1rem; padding:10px 24px;">📄 Upload & Process</button>
+    <p id="uploadStatus"></p>
+  </div>
+
+  <div id="qaBox" style="display:none; margin-top:30px;">
+    <p style="color:#0a5;">✅ Document ready. Ask a question by voice.</p>
+    <button id="btn" style="font-size:1.2rem; padding:12px 28px;">🎙️ Start recording</button>
+    <p id="status"></p>
+    <div id="result" style="font-size:1.1rem; margin-top:20px; text-align:left;"></div>
+    <div id="reply" style="margin-top:16px; font-size:1.25rem; color:#0a5; text-align:left;"></div>
+  </div>
 
 <script>
-let recorder, chunks = [], recording = false;
 const sessionId = "sess-" + Math.random().toString(36).slice(2);
+
+// ---------- upload + polling ----------
+const uploadBtn = document.getElementById("uploadBtn");
+const fileInput = document.getElementById("fileInput");
+const uploadStatus = document.getElementById("uploadStatus");
+const uploadBox = document.getElementById("uploadBox");
+const qaBox = document.getElementById("qaBox");
+
+uploadBtn.onclick = async () => {
+  const file = fileInput.files[0];
+  if (!file) { uploadStatus.textContent = "Please choose a file first."; return; }
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("session", sessionId);
+  form.append("language", document.getElementById("lang").value);
+
+  uploadStatus.textContent = "Uploading…";
+  uploadBtn.disabled = true;
+
+  await fetch("/document", { method: "POST", body: form });
+  uploadStatus.textContent = "Reading your document… this can take up to 20s";
+  pollStatus();
+};
+
+function pollStatus() {
+  const interval = setInterval(async () => {
+    const res = await fetch("/document/status?session=" + sessionId);
+    const data = await res.json();
+
+    if (data.status === "ready") {
+      clearInterval(interval);
+      uploadStatus.textContent = "";
+      uploadBox.style.display = "none";
+      qaBox.style.display = "block";
+    } else if (data.status === "failed") {
+      clearInterval(interval);
+      uploadStatus.textContent = "❌ Could not process this document. Try another file.";
+      uploadBtn.disabled = false;
+    }
+    // if "processing", keep polling silently
+  }, 2000);
+}
+
+// ---------- voice Q&A (reuses your Phase 4 pattern) ----------
+let recorder, chunks = [], recording = false;
 const btn = document.getElementById("btn");
 const status = document.getElementById("status");
 const result = document.getElementById("result");
-const card = document.getElementById("card");
 const reply = document.getElementById("reply");
 
 btn.onclick = async () => {
@@ -28,7 +93,7 @@ btn.onclick = async () => {
     recording = true;
     btn.textContent = "⏹️ Stop";
     status.textContent = "Recording… speak now";
-    card.innerHTML = ""; reply.textContent = ""; result.textContent = "";
+    result.textContent = ""; reply.textContent = "";
   } else {
     recorder.stop();
     recording = false;
@@ -44,7 +109,7 @@ async function handleAudio() {
   const tRes = await fetch("/transcribe", { method: "POST", body: form });
   const tData = await tRes.json();
   const transcript = tData.transcript || JSON.stringify(tData);
-  result.textContent = "You said: " + transcript;
+  result.textContent = "You asked: " + transcript;
 
   status.textContent = "Thinking…";
   const rRes = await fetch("/respond", {
@@ -54,15 +119,6 @@ async function handleAudio() {
   });
   const data = await rRes.json();
   status.textContent = "";
-
-  if (data.intent) {
-    const i = data.intent;
-    card.innerHTML =
-      '<div style="display:inline-block; text-align:left; padding:12px 20px; ' +
-      'border:2px solid #333; border-radius:12px;">' +
-      '<b>Action:</b> ' + i.action + ' &nbsp; <b>Day:</b> ' + i.day +
-      ' &nbsp; <b>Time:</b> ' + i.time + '</div>';
-  }
   reply.textContent = "🤖 " + data.reply;
   if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play();
 }

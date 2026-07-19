@@ -1,39 +1,33 @@
 import os
 import json
+import zipfile
+import threading
+import tempfile
 import requests
 from flask import Flask, request, jsonify, send_file
 from dotenv import load_dotenv
+from sarvamai import SarvamAI
 
 load_dotenv()
 API_KEY = os.getenv("SARVAM_API_KEY")
 
 app = Flask(__name__)
+client = SarvamAI(api_subscription_key=API_KEY)
 
-# --- a tiny in-memory "calendar": True = free, False = taken ---
-available_slots = {
-    ("Tuesday", "06:00"): False,   # taken -> triggers the alternative
-    ("Tuesday", "07:00"): True,
-    ("Tuesday", "18:00"): False,   # taken -> triggers the alternative
-    ("Tuesday", "19:00"): True,
-    ("Wednesday", "18:00"): True,
-    ("Monday", "18:00"): True,
-    ("Friday", "18:00"): True,
-}
-
-# remembers a slot we offered but the user hasn't confirmed yet (this is "state")
-conversations = {}   # holds state per session
+# ---------- per-session memory ----------
+conversations = {}
 
 def get_state(sid):
     if sid not in conversations:
-        conversations[sid] = {"pending": None, "history": []}
+        conversations[sid] = {"document": None, "doc_status": "none"}
     return conversations[sid]
 
-
+# ---------- pages ----------
 @app.route("/")
 def home():
     return send_file("index.html")
 
-
+# ---------- speech to text (Saaras) ----------
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
     audio = request.files["audio"]
@@ -44,52 +38,7 @@ def transcribe():
                       headers=headers, files=files, data=data)
     return jsonify(r.json())
 
-
-def extract_intent(transcript):
-    system_prompt = (
-        "You are a booking assistant. From the user's sentence, extract the "
-        "action (book, cancel, or reschedule), the day (a weekday like Monday), "
-        "and the time. Reply with ONLY a JSON object and nothing else, exactly: "
-        '{"action": "...", "day": "...", "time": "..."}. '
-        "Use 24-hour time like 18:00. If any field is missing, set it to \"unknown\"."
-    )
-    headers = {"api-subscription-key": API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "model": "sarvam-105b",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcript}
-        ]
-    }
-    r = requests.post("https://api.sarvam.ai/v1/chat/completions",
-                      headers=headers, json=payload)
-
-    print("LLM status code:", r.status_code)      # 200 = ok, 429 = rate limit, 401/403 = auth
-    print("LLM raw response:", r.text)             # the exact message from Sarvam
-
-    try:
-        raw = r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return None
-    return safe_parse_json(raw)
-
-
-def safe_parse_json(text):
-    if not text:                      # None or empty -> no crash, just fail gracefully
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except Exception:
-            return None
-    return None
-
-
+# ---------- text to speech (Bulbul) ----------
 def synth_speech(text, language="hi-IN"):
     headers = {"api-subscription-key": API_KEY, "Content-Type": "application/json"}
     payload = {"inputs": [text], "target_language_code": language, "model": "bulbul:v2"}
@@ -100,12 +49,97 @@ def synth_speech(text, language="hi-IN"):
     except Exception:
         return None
 
+@app.route("/speak", methods=["POST"])
+def speak():
+    body = request.get_json()
+    audio = synth_speech(body["text"], body.get("language", "hi-IN"))
+    return jsonify({"audio": audio})
 
-def find_alternative(day):
-    for (d, t), free in available_slots.items():
-        if d == day and free:
-            return t
-    return None
+# ---------- translation (Mayura) ----------
+@app.route("/translate", methods=["POST"])
+def translate():
+    body = request.get_json()
+    headers = {"api-subscription-key": API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "input": body["text"],
+        "source_language_code": "auto",
+        "target_language_code": body.get("target", "kn-IN"),
+        "model": "mayura:v1"
+    }
+    r = requests.post("https://api.sarvam.ai/translate", headers=headers, json=payload)
+    return jsonify(r.json())
+
+# ---------- document upload + background processing (Sarvam Vision) ----------
+def process_document(filepath, language, sid):
+    """Runs in a background thread: sends the file to Document Intelligence,
+    waits for the job, extracts the text, stores it in the session."""
+    state = get_state(sid)
+    try:
+        job = client.document_intelligence.create_job(
+            language=language,
+            output_format="md"
+        )
+        job.upload_file(filepath)
+        job.start()
+        status = job.wait_until_complete()
+
+        if status.job_state not in ("Completed", "PartiallyCompleted"):
+            state["doc_status"] = "failed"
+            return
+
+        # Output arrives as a ZIP; pull the markdown text out of it
+        outdir = tempfile.mkdtemp()
+        zip_path = os.path.join(outdir, "output.zip")
+        job.download_output(zip_path)
+
+        text_parts = []
+        with zipfile.ZipFile(zip_path) as z:
+            for name in z.namelist():
+                if name.endswith(".md"):
+                    text_parts.append(z.read(name).decode("utf-8", errors="ignore"))
+
+        doc_text = "\n\n".join(text_parts).strip()
+        if doc_text:
+            state["document"] = doc_text
+            state["doc_status"] = "ready"
+        else:
+            state["doc_status"] = "failed"
+    except Exception as e:
+        print("Document processing error:", e)
+        state["doc_status"] = "failed"
+
+@app.route("/document", methods=["POST"])
+def document():
+    """Receives the uploaded photo/PDF, kicks off background processing,
+    returns immediately so the browser can poll."""
+    sid = request.form.get("session", "default")
+    language = request.form.get("language", "hi-IN")
+    upload = request.files["file"]
+
+    suffix = os.path.splitext(upload.filename)[1] or ".jpg"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    upload.save(tmp.name)
+
+    state = get_state(sid)
+    state["document"] = None
+    state["doc_status"] = "processing"
+
+    threading.Thread(target=process_document,
+                     args=(tmp.name, language, sid), daemon=True).start()
+
+    return jsonify({"status": "processing"})
+
+@app.route("/document/status", methods=["GET"])
+def document_status():
+    """The polling endpoint: browser asks every couple of seconds."""
+    sid = request.args.get("session", "default")
+    state = get_state(sid)
+    return jsonify({"status": state["doc_status"]})
+
+# ---------- the brain: grounded Q&A over the document ----------
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
 
 
 @app.route("/respond", methods=["POST"])
@@ -114,43 +148,37 @@ def respond():
     text = data["text"]
     sid = data.get("session", "default")
     state = get_state(sid)
-    lower = text.lower()
 
-    yes_words = ["haan", "haa", "ha", "yes", "yeah", "yep", "theek", "thik",
-                 "ok", "okay", "kar do", "kardo", "karo", "sure", "ji",
-                 "हाँ", "हा", "ठीक", "जी", "कर दो", "करो", "बुक"]
+    doc_text = state.get("document")
+    if not doc_text:
+        reply = "कृपया पहले कोई दस्तावेज़ अपलोड कीजिए, फिर उसके बारे में पूछिए।"
+        return jsonify({"reply": reply, "audio": synth_speech(reply)})
 
-    # confirmation of a pending offer
-    if state["pending"] and any(w in lower for w in yes_words):
-        d, t = state["pending"]["day"], state["pending"]["time"]
-        available_slots[(d, t)] = False
-        reply = f"{d} {t} का स्लॉट बुक हो गया है।"
-        state["pending"] = None
-        return jsonify({"intent": None, "reply": reply, "audio": synth_speech(reply)})
+    system_prompt = (
+        "You are a helpful assistant that answers questions about a document. "
+        "The document's extracted text is provided below. Answer the user's "
+        "question using ONLY the information in the document. If the answer "
+        "is not in the document, say so honestly. Reply in the same language "
+        "the user asked in, in 1-3 short sentences suitable for being spoken aloud.\n\n"
+        "DOCUMENT:\n" + doc_text
+    )
 
-    intent = extract_intent(text)
-    if not intent:
-        reply = "माफ़ कीजिए, मुझे समझ नहीं आया।"
-        return jsonify({"intent": None, "reply": reply, "audio": synth_speech(reply)})
+    headers = {"api-subscription-key": API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "model": "sarvam-105b",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ]
+    }
+    r = requests.post("https://api.sarvam.ai/v1/chat/completions",
+                      headers=headers, json=payload)
+    try:
+        reply = r.json()["choices"][0]["message"]["content"]
+    except Exception:
+        reply = "माफ़ कीजिए, अभी जवाब नहीं दे पाया। कृपया फिर से पूछिए।"
 
-    day, time = intent.get("day"), intent.get("time")
-
-    if day == "unknown" or time == "unknown":
-        reply = "कृपया बताइए किस दिन और किस समय का अपॉइंटमेंट चाहिए?"
-    elif available_slots.get((day, time)) is True:
-        available_slots[(day, time)] = False
-        reply = f"{day} {time} का स्लॉट बुक हो गया है।"
-    elif available_slots.get((day, time)) is False:
-        alt = find_alternative(day)
-        if alt:
-            state["pending"] = {"day": day, "time": alt}
-            reply = f"{time} का स्लॉट भरा हुआ है। {day} {alt} उपलब्ध है। क्या मैं बुक कर दूँ?"
-        else:
-            reply = f"{day} को कोई स्लॉट उपलब्ध नहीं है।"
-    else:
-        reply = f"{day} {time} के लिए कोई स्लॉट नहीं है।"
-
-    return jsonify({"intent": intent, "reply": reply, "audio": synth_speech(reply)})
+    return jsonify({"reply": reply, "audio": synth_speech(reply)})
 
 if __name__ == "__main__":
     app.run(port=8000, debug=False)
