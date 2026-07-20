@@ -1,4 +1,5 @@
-flask
-requests
-python-dotenv
-gunicorn
+flask>=3.0
+requests>=2.31
+python-dotenv>=1.0
+sarvamai>=0.1.28
+gunicorn>=21.2
