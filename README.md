@@ -30,8 +30,8 @@ Every model call in this app is Sarvam.
   │   (auto-detects the language)      │        │
   │        │                           │        ▼
   │        ▼                           │   sarvam-105b → JSON
-  │   sarvam-105b  grounded answer     │   (null when absent —
-  │        │        (streamed)         │    never invented)
+  │   sarvam-105b  grounded answer     │   (prompted to use null
+  │        │        (streamed)         │    when absent)
   │        ▼                           │
   │   Bulbul v2    text → speech       │
   ▼                                    ▼
@@ -42,13 +42,13 @@ Every model call in this app is Sarvam.
 
 ---
 
-## Two things I had to actually solve
+## Two implementation decisions
 
 Most of the build was plumbing. Two problems were not, and both are visible in the code.
 
 ### 1. Multi-turn conversation silently locks to one language
 
-This is the bug I'd want to talk about. Ask a question in Hindi, then follow up in English,
+In the recorded development checks, a question in Hindi followed by one in English showed a language-anchoring problem:
 and the English question still gets answered in Hindi. Once one Hindi assistant turn is in
 the message list, it anchors every later reply.
 
@@ -62,39 +62,35 @@ I tried to instruct my way out of it. All of these still returned Hindi:
 | Both of the above together | Hindi |
 | **Dropping the history entirely** | **English** |
 
-So it wasn't a prompt-strength problem — the history itself was the cause, and no
-instruction outranked it.
+Those checks suggested that prior assistant turns were anchoring the response language. They do not establish that stronger instructions can never work.
 
 The fix keeps the history but changes *where* it lives. Prior turns move out of the message
 list and into the system prompt as plain recap text, leaving the current question as the
 only `user` message. The model still resolves *"and what about the notice period?"* and
 *"is it refundable?"* against earlier turns, but takes its reply language from the live
-question. Verified in both directions — Hindi → English and English → Hindi, plus Kannada.
+question. The development notes record checks in both directions, Hindi → English and English → Hindi, plus Kannada. The offline suite checks recap construction; it does not verify a live model’s language behavior.
 
 See `build_recap()` in [`app.py`](app.py); the reasoning is written down there so it doesn't
 get "simplified" back into a bug. Regression tests in [`tests/test_app.py`](tests/test_app.py).
 
-### 2. The model thinks for 7–10 seconds before it says anything
+### 2. Show progress while waiting for an answer
 
-`sarvam-105b` is a reasoning model. It spends most of its wall clock emitting
-`reasoning_content` before the first token of the actual answer:
+In the recorded development configuration, `sarvam-105b` emitted `reasoning_content` before the first answer token. The notes record:
 
-- Answering *"reply with exactly: OK"* costs **565 completion tokens**
-- On a real document question, **913–1373 reasoning chunks** arrive before the answer starts
-- `reasoning_effort: "low"` does **not** meaningfully help — measured 12.1s vs 10.1s for
-  `"high"` on the same question, i.e. within noise and occasionally slower
+- One *"reply with exactly: OK"* request used **565 completion tokens**
+- Document-question checks produced **913–1373 reasoning chunks** before the answer started
+- One `reasoning_effort: "low"` check took 12.1s versus 10.1s for `"high"` on the same question; that pair alone cannot establish which setting is faster
 
-You can't remove the wait (`reasoning_effort` only accepts `low`/`medium`/`high` — there's no
-"off"), so the app is built around it instead. `/respond` streams Server-Sent Events and
+This implementation uses `reasoning_effort="high"`. The observations below describe that development configuration; they are not a claim about every current model or API option. The app handles the wait explicitly. `/respond` streams Server-Sent Events and
 separates the two channels: reasoning deltas become a live *"Reading the document — 7.4s"*
 counter, and answer deltas render token by token. A ten-second wait with visible progress
 reads very differently from a ten-second frozen spinner.
 
 ---
 
-## Measured latency
+## Recorded development timings
 
-One-page PDF, single machine, ordinary broadband. Real observed numbers — reproduce with
+One-page PDF, single machine, ordinary broadband. Historical development observations; raw timing logs are not included. Recheck with
 `python tests/e2e.py` (needs a key).
 
 | Step | Model | Observed |
@@ -108,8 +104,7 @@ One-page PDF, single machine, ordinary broadband. Real observed numbers — repr
 Two honest caveats on these. **Anything that routes through `sarvam-105b` varies a lot
 run to run** — the same 5-field extraction measured 2.1s once and 15.2s another time, on
 an unchanged document and prompt. Reasoning length is the variable, and it isn't stable, so
-treat the ranges as ranges rather than picking the flattering end. Digitization and speech
-recognition were consistent across every run.
+treat the ranges as ranges rather than picking the flattering end. No repeated-run distribution or service-level guarantee is established here.
 
 Digitization happens once; every later question only pays the answer cost.
 
@@ -117,7 +112,7 @@ Digitization happens once; every later question only pays the answer cost.
 
 ## Grounding
 
-The system prompt restricts answers to the extracted text, and it holds up:
+The system prompt asks for answers grounded in the extracted text. Recorded examples include:
 
 - *"What is the landlord's blood group?"* → **"दस्तावेज़ में लैंडलॉर्ड के ब्लड ग्रुप का उल्लेख नहीं है।"**
   (not mentioned in the document)
@@ -171,8 +166,6 @@ Deploying: `Procfile` runs gunicorn with threads, which the SSE endpoint needs.
 
 ## Known limits
 
-Worth being straight about what this is and isn't:
-
 - **Sessions are in-memory.** Fine for one process; a restart drops documents, and running
   multiple gunicorn *workers* would split state. Redis is the fix, and threads (not workers)
   are what the Procfile uses for now.
@@ -181,7 +174,9 @@ Worth being straight about what this is and isn't:
   order, but I haven't measured long documents; text is truncated at 24k characters.
 - **8–16s per answer**, for the reasons above, and not consistently at the fast end.
   Acceptable for a document you're puzzling over, too slow for a real-time conversation.
-- **Handwriting is untested.** Printed text is what I verified.
+- **Handwriting is untested.** The documented checks use printed text.
+- **Prompt-based grounding is not a guarantee.** Document text and conversation history are untrusted inputs, including when placed in the system prompt. Prompt injection and incorrect answers remain possible.
+- **Use fictional documents.** Uploaded content is processed by external APIs; there is no production access-control or privacy review for this prototype.
 
 ---
 
